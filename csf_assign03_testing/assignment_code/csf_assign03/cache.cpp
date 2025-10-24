@@ -11,7 +11,7 @@ checkHit(Cache& c, const cacheInfo& info, uint32_t addr) {
     uint32_t ind_bits = log2(info.index);
     uint32_t off_bits = log2(info.offset);
 
-    uint32_t index_mask = (1 << ind_bits) -1;
+    uint32_t index_mask = (1u << ind_bits) -1u;
 
     uint32_t index = (addr >> off_bits) & index_mask;
     uint32_t tag = (addr >> (off_bits + ind_bits));
@@ -28,7 +28,7 @@ checkHit(Cache& c, const cacheInfo& info, uint32_t addr) {
         if (tag_comp == tag && set.slots[i].valid) {
             cache_hit.first = true;
             cache_hit.second = std::make_pair(index, i); //issues with autocast?
-            set.slots[i].access_ts = stats.cycles; //need to check for cycles
+            // set.slots[i].access_ts = stats.cycles; //need to check for cycles
             return cache_hit; 
         } 
 
@@ -46,7 +46,7 @@ checkHit(Cache& c, const cacheInfo& info, uint32_t addr) {
     return cache_hit;
 }
 
-unsigned lru_evict(Set& set) {
+unsigned lru_evict(Set& set, std::string write_through, unsigned offset) {
     unsigned min_index = 0;
     uint32_t min_ts = set.slots[0].access_ts;
 
@@ -57,10 +57,14 @@ unsigned lru_evict(Set& set) {
         }
     }
 
+    if(write_through == "write-back" && set.slots[min_index].dirty) {
+        stats.cycles += ((offset/4) * 100); //store the modified
+    }
+
     return min_index;
 }
 
-unsigned fifo_evict(Set& set) {
+unsigned fifo_evict(Set& set, std::string write_through, unsigned offset) {
     unsigned min_index = 0;
     uint32_t min_ts = set.slots[0].load_ts;
 
@@ -69,6 +73,10 @@ unsigned fifo_evict(Set& set) {
             min_ts = set.slots[i].load_ts;
             min_index = i;
         }
+    }
+
+     if(write_through == "write-back" && set.slots[min_index].dirty) {
+        stats.cycles += ((offset/4) * 100); //store the modified
     }
 
     return min_index;
@@ -85,11 +93,13 @@ void load(Cache& c, const cacheInfo& info, uint32_t addr) {
     stats.cycles++; //single cache load
     cache_hit = checkHit(c, info, addr);
     std::pair<unsigned, unsigned>& indexes = cache_hit.second;
-
+    Set& set = c.sets[indexes.first]; //get the respective set
+    //set.slots[indexes.second].access_ts = stats.cycles;
     //If cache hit, update cacheStats
     if (cache_hit.first == true) {
         // update l_hits
         stats.l_hits++;
+        set.slots[indexes.second].access_ts = stats.cycles;
         //additional updates?        
     } else {
         //If cache miss, update cacheStats, bring/evict the new addr based on FIFO/LRU
@@ -100,30 +110,29 @@ void load(Cache& c, const cacheInfo& info, uint32_t addr) {
         //  2) see if theres any non-valid slots - fill them
         //  3) if everything full, determine based on LRU or FIFO
         // Update the load_ts and acces_ts, and current cycles
-        Set& set = c.sets[indexes.first]; //get the respective set
         stats.cycles += ((info.offset/4) * 100); //to access main memory
         if (indexes.second != info.assoc) {
-            set.slots[indexes.second].tag = addr;
-            set.slots[indexes.second].valid = true;
-            set.slots[indexes.second].load_ts = stats.cycles;
+            //means replacement can happen without eviction
         } else {
             //eviction differes based on LRU or FIFO - seperate here?
             std::string lru_fifo = info.evic;
-            unsigned to_replace = info.assoc;
+            unsigned to_replace;
             if (lru_fifo == "lru") {
                 //LRU eviction logic, look for the first access_ts
-                to_replace = lru_evict(set);
+                to_replace = lru_evict(set, info.write_through, info.offset);
             } else if (lru_fifo == "fifo") {
                 //FIFO eviction logic, look for the first load_ts
-                to_replace = fifo_evict(set);
+                to_replace = fifo_evict(set, info.write_through, info.offset);
             } else {
                 std::cerr << "wrong parameter for fifo / lru" << std::endl;
             }
-            set.slots[to_replace].tag = addr;
-            set.slots[to_replace].valid = true;
-            set.slots[to_replace].load_ts = stats.cycles;
+            indexes.second = to_replace;
         }
-        
+        set.slots[indexes.second].tag = addr;
+        set.slots[indexes.second].valid = true;
+        set.slots[indexes.second].dirty = false;
+        set.slots[indexes.second].load_ts = stats.cycles;
+        set.slots[indexes.second].access_ts = stats.cycles;
     }
     
 }
@@ -134,21 +143,71 @@ void load(Cache& c, const cacheInfo& info, uint32_t addr) {
 void store(Cache& c, const cacheInfo& info, uint32_t addr) {
     
     stats.stores++;
-    //Determine the Tag of the Addr
     //Sequential search to determine Tag hit
     std::pair<bool, std::pair<unsigned, unsigned>> cache_hit;
 
+    stats.cycles++; //single cache load
     cache_hit = checkHit(c, info, addr);
+    std::pair<unsigned, unsigned>& indexes = cache_hit.second;
+    Set& set = c.sets[indexes.first]; //get the respective set
+
     //If Cache hit, update cacheStats , and based on write-through or back
     if (cache_hit.first == true) {
         // update s_hits;
+        stats.s_hits++;
+        
         // update the cache for write-through (both cache and memory)
-        // or non-write through (only cache, marks block dirty)
+        if (info.write_through == "write-through") {
+            stats.cycles += 100;//((info.offset/4) * 100); //for main mem access
+            stats.cycles++; //for cache store? check this
+        } else if (info.write_through == "write-back") {
+            // or non-write through (only cache, marks block dirty)
+            set.slots[indexes.second].dirty = true; //the cache contents have changed locally
+            stats.cycles++;
+        } else {
+            std::cerr << "write_through error doesn't exist" << std::endl;
+        }
+        set.slots[indexes.second].access_ts = stats.cycles;
     } else {
         //If Cache miss, update cacheStats, and determine write-allocate or no
         // update s_misses;
+        stats.s_misses++;
         // update the caceh for write-allocate (write relvant memroy to cache)
-        // no-write allocate will not modify the cache here
+        if (info.write_alloc == "write-allocate") {
+            if (indexes.second != info.assoc) {
+                //stats.cycles++; //we update the cache where its empty -- necessary addition?
+            } else {
+                //eviction differes based on LRU or FIFO - seperate here?
+                std::string lru_fifo = info.evic;
+                unsigned to_replace;
+                if (lru_fifo == "lru") {
+                    //LRU eviction logic, look for the first access_ts
+                    to_replace = lru_evict(set, info.write_through, info.offset);
+                } else if (lru_fifo == "fifo") {
+                    //FIFO eviction logic, look for the first load_ts
+                    to_replace = fifo_evict(set, info.write_through, info.offset);
+                } else {
+                    std::cerr << "wrong parameter for fifo / lru" << std::endl;
+                }
+                indexes.second = to_replace;
+            }
+            set.slots[indexes.second].tag = addr;
+            set.slots[indexes.second].valid = true;
+            set.slots[indexes.second].dirty = false;
+            set.slots[indexes.second].load_ts = stats.cycles;
+            set.slots[indexes.second].access_ts = stats.cycles;
+            if ( info.write_through == "write-through" ) {
+                stats.cycles += 100; //we write to the main mem
+            }
+            stats.cycles++; //single cache store
+            stats.cycles += ((info.offset/4) * 100); //load from the main memory to the cache
+        } else if (info.write_alloc == "no-write-allocate") {
+            // no-write allocate will not modify the cache here
+            stats.cycles += 100; //write straight to memory
+        } else {
+            std::cerr << "write_alloc error: doesn't exist" << std::endl;
+        }
+        
     }
 
     

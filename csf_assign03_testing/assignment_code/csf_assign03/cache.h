@@ -43,9 +43,9 @@ void printCacheStats();
 std::pair<bool, std::pair<unsigned, unsigned>> 
 checkHit(Cache& c, const cacheInfo& info, uint32_t addr);
 
-unsigned lru_evict(Set& set);
+unsigned lru_evict(Set& set, std::string write_through, unsigned offset);
 
-unsigned fifo_evict(Set& set);
+unsigned fifo_evict(Set& set, std::string write_through, unsigned offset);
 
 
 
